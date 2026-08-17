@@ -1,0 +1,46 @@
+name: Sync SFW-only Keiyoushi index
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # runs every hour
+  workflow_dispatch: {}    # lets you also trigger it manually from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch, filter, and write index
+        run: |
+          python3 - <<'PYEOF'
+          import json, urllib.request
+
+          url = "https://raw.githubusercontent.com/keiyoushi/extensions/repo/index.json"
+          with urllib.request.urlopen(url) as r:
+              data = json.load(r)
+
+          exts = data["extensionList"]["extensions"]
+          # Keep SAFE only — excludes both fully-18+ AND mixed-content sources
+          safe = [e for e in exts if e.get("contentWarning") == "CONTENT_WARNING_SAFE"]
+
+          data["name"] = "Keiyoushi (SFW-only)"
+          data["badgeLabel"] = "KEI-SFW"
+          data["extensionList"] = {"extensions": safe}
+
+          with open("index.min.json", "w") as f:
+              json.dump(data, f, separators=(",", ":"))
+
+          print(f"Kept {len(safe)} of {len(exts)} extensions")
+          PYEOF
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add index.min.json
+          git diff --staged --quiet || git commit -m "Auto-sync filtered index ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git push
