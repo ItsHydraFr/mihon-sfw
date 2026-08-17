@@ -1,0 +1,89 @@
+name: Sync SFW-only Aniyomi index
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # runs every hour
+  workflow_dispatch: {}    # lets you also trigger it manually from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch, filter, dedupe, and write combined index
+        run: |
+          python3 - <<'PYEOF'
+          import json, urllib.request
+
+          # Listed lowest-priority to highest-priority: later sources win on pkg conflicts.
+          # Kohi-den is being sunset in favor of Yuzono Anime, so Yuzono is treated as most current.
+          SOURCES = [
+              ("kohiden", "https://kohiden.xyz/Kohi-den/extensions/raw/branch/main/index.min.json",
+               "https://kohiden.xyz/Kohi-den/extensions/raw/branch/main/"),
+              ("secozzi", "https://raw.githubusercontent.com/Secozzi/aniyomi-extensions/refs/heads/repo/index.min.json",
+               "https://raw.githubusercontent.com/Secozzi/aniyomi-extensions/refs/heads/repo/"),
+              ("yuzono", "https://raw.githubusercontent.com/yuzono/anime-repo/repo/index.min.json",
+               "https://raw.githubusercontent.com/yuzono/anime-repo/repo/"),
+          ]
+
+          def normalize(data):
+              """Handle both the legacy flat-array schema and the newer contentWarning schema."""
+              if isinstance(data, list):
+                  return data
+              if isinstance(data, dict) and "extensionList" in data:
+                  out = []
+                  for e in data["extensionList"]["extensions"]:
+                      e = dict(e)
+                      e["nsfw"] = 0 if e.get("contentWarning") == "CONTENT_WARNING_SAFE" else 1
+                      e["pkg"] = e.get("pkg") or e.get("packageName")
+                      res = e.get("resources", {})
+                      if res.get("apkUrl"):
+                          e["apk"] = res["apkUrl"]
+                      out.append(e)
+                  return out
+              return []
+
+          merged = {}
+          for label, url, base in SOURCES:
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      data = json.load(r)
+              except Exception as ex:
+                  print(f"WARNING: {label} unreachable, skipping ({ex})")
+                  continue
+
+              exts = normalize(data)
+              kept = skipped = 0
+              for e in exts:
+                  if e.get("nsfw"):
+                      skipped += 1
+                      continue
+                  pkg = e.get("pkg")
+                  if not pkg:
+                      continue
+                  # Rewrite bare filenames into absolute URLs pointing at their real source,
+                  # since this combined repo doesn't host the actual APK files itself.
+                  if not str(e.get("apk", "")).startswith("http"):
+                      e["apk"] = base + "apk/" + e["apk"]
+                  merged[pkg] = e
+                  kept += 1
+              print(f"{label}: {kept} safe kept, {skipped} nsfw-flagged excluded")
+
+          result = sorted(merged.values(), key=lambda e: e["name"])
+          with open("aniyomi-index.min.json", "w") as f:
+              json.dump(result, f, separators=(",", ":"))
+          print(f"TOTAL combined (deduped): {len(result)} extensions")
+          PYEOF
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add aniyomi-index.min.json
+          git diff --staged --quiet || git commit -m "Auto-sync filtered index ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git push
